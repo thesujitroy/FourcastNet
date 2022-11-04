@@ -172,8 +172,8 @@ class AFNONet(nn.Module):
     def __init__(
             self,
             params,
-            img_size=(720, 1440),
-            patch_size=(16, 16),
+            img_size=(360, 576),
+            patch_size=(8, 8),
             in_chans=2,
             out_chans=2,
             embed_dim=768,
@@ -274,8 +274,8 @@ class PatchEmbed(nn.Module):
 
 
 if __name__ == "__main__":
-    model = AFNONet(img_size=(720, 1440), patch_size=(4,4), in_chans=3, out_chans=10)
-    sample = torch.randn(1, 3, 720, 1440)
+    model = AFNONet(img_size=(360, 576), patch_size=(4,4), in_chans=3, out_chans=10)
+    sample = torch.randn(1, 3, 360, 576)
     result = model(sample)
     print(result.shape)
     print(torch.norm(result))

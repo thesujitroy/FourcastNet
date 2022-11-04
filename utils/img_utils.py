@@ -85,7 +85,7 @@ def reshape_fields(img, inp_or_tar, crop_size_x, crop_size_y,rnd_x, rnd_y, param
       img = np.expand_dims(img, 0)
 
     
-    img = img[:, :, 0:720] #remove last pixel
+    img = img[:, :, 0:360] #remove last pixel
     n_history = np.shape(img)[0] - 1
     img_shape_x = np.shape(img)[-2]
     img_shape_y = np.shape(img)[-1]
@@ -152,7 +152,7 @@ def reshape_precip(img, inp_or_tar, crop_size_x, crop_size_y,rnd_x, rnd_y, param
     if len(np.shape(img)) ==2:
       img = np.expand_dims(img, 0)
 
-    img = img[:,:720,:]
+    img = img[:,:360,:]
     img_shape_x = img.shape[-2]
     img_shape_y = img.shape[-1]
     n_channels = 1
