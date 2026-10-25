@@ -1,0 +1,103 @@
+### FourCastNet mixer comparison (train_mixers.py, inference/inference_mixers.py) ###
+#
+# One base, then one named config per mixer that overrides ONLY `mixer`, so any
+# difference in results comes from the token mixer (tests/test_mixers.py checks this).
+# Loaded with PyYAML (utils/mixer_params.py): write floats with a dot, e.g. 5.0e-4.
+#
+#   python train_mixers.py --yaml_config config/mixer_comparison.yaml --config tucker_spectral --enable_amp
+#   python train_mixers.py ... --override max_epochs=1 max_iters_per_epoch=20    # devel smoke run
+
+mixer_base: &base
+  # ---- FourCastNet afno_backbone settings (config/AFNO.yaml), unchanged ----
+  loss: 'l2'
+  lr: 5.0e-4
+  scheduler: 'CosineAnnealingLR'
+  num_data_workers: 4
+  dt: 1                       # one 6 h step
+  n_history: 0
+  prediction_type: 'iterative'
+  prediction_length: 41       # inference: 41 x 6 h = 10 days
+  n_initial_conditions: 5
+  ics_type: "default"
+  save_raw_forecasts: !!bool False
+  save_channel: !!bool False
+  masked_acc: !!bool False
+  maskpath: None
+  perturb: !!bool False
+  add_grid: !!bool False
+  N_grid_channels: 0
+  gridtype: 'sinusoidal'
+  roll: !!bool False
+  batch_size: 64              # global; divided by the number of GPUs
+  num_blocks: 8               # AFNO block-diagonal blocks
+  patch_size: 8
+  target: 'default'
+  in_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  out_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  normalization: 'zscore'
+  orography: !!bool False
+  orography_path: None
+  log_to_screen: !!bool True
+  log_to_wandb: !!bool True
+  save_checkpoint: !!bool True
+  enable_nhwc: !!bool False
+  optimizer_type: 'Adam'      # upstream FusedAdam (apex) is the same update rule; apex is not installed on NAS
+  crop_size_x: None
+  crop_size_y: None
+  two_step_training: !!bool False
+  plot_animations: !!bool False
+  add_noise: !!bool False
+  noise_std: 0
+
+  # ---- data: FourCastNet's preprocessed ERA5 layout. PLACEHOLDER PATHS, set when the data lands ----
+  # year files with `fields` of shape (T, 20, 721, 1440) at 6 h; train 1979-2015, test 2016-2017, out_of_sample 2018
+  train_data_path:   '/nobackupnfs1/sroy14/FourCastNet/h5/train'
+  valid_data_path:   '/nobackupnfs1/sroy14/FourCastNet/h5/test'
+  inf_data_path:     '/nobackupnfs1/sroy14/FourCastNet/h5/out_of_sample'
+  time_means_path:   '/nobackupnfs1/sroy14/FourCastNet/h5/stats/time_means.npy'
+  global_means_path: '/nobackupnfs1/sroy14/FourCastNet/h5/stats/global_means.npy'
+  global_stds_path:  '/nobackupnfs1/sroy14/FourCastNet/h5/stats/global_stds.npy'
+  exp_dir: '/nobackupnfs1/sroy14/sujit_home/Tucker_map/FourCastNet/expts/mixer_comparison'
+  # FourCastNet's 20 variables, in file order (inference.py: u10 0, v10 1, t2m 2, t850 5, z500 14)
+  channel_names: ['u10', 'v10', 't2m', 'sp', 'msl', 't850', 'u1000', 'v1000', 'z1000', 'u850',
+                  'v850', 'z850', 'u500', 'v500', 'z500', 't500', 'z50', 'r500', 'r850', 'tcwv']
+
+  # ---- comparison settings (identical for every mixer) ----
+  max_epochs: 10              # FourCastNet pre-training is 150; a matched short budget, ~8.4k steps at batch 64
+  max_iters_per_epoch: None   # cap steps per epoch (devel runs); None = full epoch
+  embed_dim: 768
+  depth: 12
+  seed: 42                    # initial weights and training-sample order
+  amp_dtype: 'bfloat16'       # with --enable_amp; 'float16' adds a GradScaler as upstream
+  n_valid_samples: 256        # fixed, evenly spaced over the test years, same for every run and epoch
+  save_valid_images: !!bool False
+  wandb_log_every: 10         # steps between step_loss points
+  wandb_entity: 'nasa-impact'
+  wandb_project: 'StR World Model'
+  wandb_group: 'era5-mixer-comparison'
+  mixer: {type: afno}
+
+# ---------------------------------------------------------------- the five mixers
+# Tucker settings are the Helio NAS ones. On the 90 x 180 token grid the DFT limits
+# are kh <= 45 and kw <= 90; tucker_free needs p <= 90 and q <= 180.
+
+afno:
+  <<: *base
+  mixer: {type: afno}         # FourCastNet itself: num_blocks 8, sparsity 0.01, all modes kept
+
+vanilla:
+  <<: *base
+  mixer: {type: vanilla, num_heads: 12, qkv_bias: false, attn_drop: 0.0, proj_drop: 0.0}
+
+tucker_free:
+  <<: *base
+  mixer: {type: tucker_free, L: 4, p: 32, q: 32, r: 128, zero_init: false}
+
+tucker_spectral:
+  <<: *base
+  mixer: {type: tucker_spectral, L: 4, kh: 32, kw: 32, r: 128, basis: dft, zero_init: false}
+
+tucker_adaptive:
+  <<: *base
+  mixer: {type: tucker_adaptive, L: 4, kh: 32, kw: 32, r: 128, ctx_hidden: 64, lat_basis: 8,
+          gate_range: 1.0, zero_init: false}

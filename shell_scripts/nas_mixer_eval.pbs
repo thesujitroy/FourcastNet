@@ -1,0 +1,55 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_eval
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## Rollout evaluation of the trained mixer runs (inference/inference_mixers.py): 10-day
+## rollouts from an initial condition every 9 days of the out-of-sample year, RMSE and ACC
+## against ERA5 and persistence, then one comparison table (scripts/summarize_rollouts.py)
+## in results/mixer_rollouts.md. One GPU per config, all in parallel. Submit from FourCastNet/,
+## chained to the training jobs:
+##   qsub -W depend=afterany:<job>:<job>:... shell_scripts/nas_mixer_eval.pbs
+##   qsub -v CONFIGS="afno tucker_spectral" shell_scripts/nas_mixer_eval.pbs
+
+#PBS -l select=1:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -q R298043@pbspl4
+#PBS -l walltime=04:00:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_eval.out.temp
+#PBS -e pbs_logs/fcn_eval.err.temp
+
+cd "$PBS_O_WORKDIR"
+JOB_ID=${PBS_JOBID%%.*}
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp pbs_logs/${JOB_ID}_${PBS_JOBNAME}.${ext}
+done
+
+. shell_scripts/nas_env.sh
+nvidia-smi -L
+
+CONFIGS=${CONFIGS:-"afno vanilla tucker_free tucker_spectral tucker_adaptive"}
+RUN_NUM=${RUN_NUM:-0}
+NGPU=$(nvidia-smi -L | wc -l)
+mkdir -p results pbs_logs/eval_${JOB_ID}
+
+i=0
+PIDS=()
+for config in $CONFIGS; do
+  GPU=$((i % NGPU))
+  echo "=== GPU $GPU: $config run $RUN_NUM"
+  CUDA_VISIBLE_DEVICES=$GPU python inference/inference_mixers.py --config $config --run_num $RUN_NUM \
+      > pbs_logs/eval_${JOB_ID}/$config.log 2>&1 &
+  PIDS+=($!)
+  i=$((i + 1))
+  # more configs than GPUs on this node: wait for this batch first
+  if [ $((i % NGPU)) -eq 0 ]; then
+    for pid in ${PIDS[@]}; do wait $pid; done
+    PIDS=()
+  fi
+done
+for pid in ${PIDS[@]}; do wait $pid; done
+tail -n 2 pbs_logs/eval_${JOB_ID}/*.log
+
+python scripts/summarize_rollouts.py expts/mixer_comparison --output results/mixer_rollouts.md
+echo "Done with PBS"

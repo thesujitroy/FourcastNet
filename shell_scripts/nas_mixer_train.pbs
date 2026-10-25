@@ -1,0 +1,70 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_train
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## One FourCastNet mixer-comparison training run (train_mixers.py) on 8 mil_a100 nodes
+## (32 GPUs; global batch 64 -> 2 samples per GPU). The mixer is chosen at submit time;
+## matching -N/-o/-e keep parallel jobs' logs apart. Submit from FourCastNet/:
+##   for k in afno vanilla tucker_free tucker_spectral tucker_adaptive; do
+##     qsub -N fcn_$k -o pbs_logs/fcn_$k.out.temp -e pbs_logs/fcn_$k.err.temp \
+##          -v CONFIG=$k shell_scripts/nas_mixer_train.pbs
+##   done
+## Devel smoke run (1 epoch x 50 steps into expts/mixer_comparison_devel), 2 nodes, devel queue:
+##   qsub -q gpu_devel@pbspl4 -l walltime=01:00:00 -l select=2:model=mil_a100:ncpus=64:ngpus=4:mem=480GB \
+##        -v CONFIG=tucker_spectral,NUM_NODES=2,MODE=devel shell_scripts/nas_mixer_train.pbs
+## A resubmitted run resumes from expts/mixer_comparison/<config>/<run>/training_checkpoints/ckpt.tar.
+## NUM_NODES x 4 must divide batch_size (64): 1, 2, 4, 8 or 16 nodes.
+
+## R298043 is the s3331_sro reservation (Oct 2 -> Oct 15 2026); override with qsub -q.
+#PBS -l select=8:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -l place=scatter:excl
+#PBS -q R298043@pbspl4
+#PBS -l walltime=24:00:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_train.out.temp
+#PBS -e pbs_logs/fcn_train.err.temp
+
+cd "$PBS_O_WORKDIR"
+
+NUM_NODES=${NUM_NODES:-8}                        # must match select= (qsub -v NUM_NODES=... -l select=...)
+GPUS_PER_NODE=4                                 # must match ngpus= in the select above
+CONFIG=${CONFIG:?submit with -v CONFIG=<afno|vanilla|tucker_free|tucker_spectral|tucker_adaptive>}
+RUN_NUM=${RUN_NUM:-0}
+MODE=${MODE:-full}
+TIME_LIMIT=${TIME_LIMIT:-0}
+
+export BASE=$PWD
+export MASTER_PORT=$(shuf -i 20000-65000 -n 1)
+export MASTER_ADDR=$(head -n1 $PBS_NODEFILE)
+export WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
+JOB_ID=$PBS_JOBID
+
+echo "JOB ID is ${JOB_ID}, config ${CONFIG}, run ${RUN_NUM}, mode ${MODE}"
+## Bind this job's live output to a per-job name.
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp "pbs_logs/${JOB_ID%%.*}_${PBS_JOBNAME}.${ext}"
+done
+
+NODES=($(sort -u $PBS_NODEFILE))
+echo cluster nodes: ${NODES[@]}
+if [[ "$NUM_NODES" -ne ${#NODES[@]} ]]; then
+    echo "Aborting, NUM_NODES and nodes requested are not consistent"
+    exit 2
+fi
+
+C=1
+for node in ${NODES[@]}; do
+  if [[ $node != $MASTER_ADDR ]]; then
+    ssh -o StrictHostKeyChecking=no -i $HOME/.ssh/id_rsa $node "cd $BASE; sh shell_scripts/nas_launch.sh $C $NUM_NODES $WORLD_SIZE $MASTER_ADDR $MASTER_PORT $JOB_ID $PBS_JOBID $TMPDIR $GPUS_PER_NODE $CONFIG $RUN_NUM $MODE $TIME_LIMIT" &
+    C=$((C + 1))
+    sleep 2
+  fi
+done
+
+# process on master node runs the last!
+sh $BASE/shell_scripts/nas_launch.sh 0 $NUM_NODES $WORLD_SIZE $MASTER_ADDR $MASTER_PORT $JOB_ID $PBS_JOBID $TMPDIR $GPUS_PER_NODE $CONFIG $RUN_NUM $MODE $TIME_LIMIT
+
+wait
+echo "Done with PBS"

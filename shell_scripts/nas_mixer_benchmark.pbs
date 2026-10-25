@@ -1,0 +1,73 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_bench
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## Multi-seed cost benchmark (scripts/benchmark_mixers.py) of the five FourCastNet mixers at
+## 720 x 1440 with synthetic input already on the GPU (no data needed; run it any time).
+## Each GPU runs its share of the kind groups one after another, never two at once.
+## Submit from FourCastNet/:
+##   qsub shell_scripts/nas_mixer_benchmark.pbs
+##   qsub -v SEEDS="0 1 2",BATCH_SIZES="1 2" shell_scripts/nas_mixer_benchmark.pbs
+## Rows land in results/mixer_benchmark/seeds_<job id>/<group>/measurements.jsonl and the
+## mean +- std table in results/mixer_benchmark/seeds_<job id>/summary.md.
+
+#PBS -l select=1:model=mil_a100:ncpus=32:ngpus=2:mem=240GB
+#PBS -q gpu_devel@pbspl4
+#PBS -l walltime=02:00:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_bench.out.temp
+#PBS -e pbs_logs/fcn_bench.err.temp
+
+cd "$PBS_O_WORKDIR"
+JOB_ID=${PBS_JOBID%%.*}
+echo "JOB ID is ${PBS_JOBID}"
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp pbs_logs/${JOB_ID}_${PBS_JOBNAME}.${ext}
+done
+
+. shell_scripts/nas_env.sh
+nvidia-smi -L
+
+SEEDS=${SEEDS:-"0 1 2 3 4"}
+BATCH_SIZES=${BATCH_SIZES:-"1 2"}
+WARMUP=${WARMUP:-5}
+REPEATS=${REPEATS:-20}
+OUT=results/mixer_benchmark/seeds_${JOB_ID}
+mkdir -p $OUT
+
+# vanilla alone on a GPU: ~6x the forward FLOPs of the others at 16,200 tokens.
+GROUPS_="vanilla:vanilla fast:afno,tucker_free,tucker_spectral,tucker_adaptive"
+
+NGPU=$(nvidia-smi -L | wc -l)
+declare -a GPU_CMDS
+i=0
+for group in $GROUPS_; do
+  name=${group%%:*}
+  kinds=$(echo ${group#*:} | tr , ' ')
+  RUN_OUT=$OUT/$name
+  mkdir -p $RUN_OUT
+  GPU=$((i % NGPU))
+  echo "=== GPU $GPU: kinds=$kinds seeds=$SEEDS -> $RUN_OUT"
+  GPU_CMDS[$GPU]="${GPU_CMDS[$GPU]} echo \"=== $RUN_OUT start \$(date)\"; python scripts/benchmark_mixers.py --configs $kinds --img-size 720 1440 --batch-sizes $BATCH_SIZES --scope both --device cuda --warmup $WARMUP --repeats $REPEATS --seeds $SEEDS --output $RUN_OUT > $RUN_OUT/run.log 2>&1 || echo \"=== $RUN_OUT FAILED\";"
+  i=$((i + 1))
+done
+
+PIDS=()
+for GPU in $(seq 0 $((NGPU - 1))); do
+  [ -z "${GPU_CMDS[$GPU]}" ] && continue
+  CUDA_VISIBLE_DEVICES=$GPU bash -c "${GPU_CMDS[$GPU]}" > $OUT/gpu${GPU}.log 2>&1 &
+  PIDS+=($!)
+done
+
+RC=0
+for pid in ${PIDS[@]}; do
+  wait $pid || RC=1
+done
+echo "=== all benchmark processes finished, rc=$RC, $(date)"
+cat $OUT/gpu*.log
+grep -l FAILED $OUT/gpu*.log >/dev/null 2>&1 && RC=1
+grep -h -E ': (ok|oom|error)$' $OUT/*/run.log | sort | uniq -c
+python ../HelioFM-surya_1.1/scripts/summarize_benchmark_seeds.py $OUT --output $OUT
+echo "Done with PBS (rc=$RC)"
