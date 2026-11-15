@@ -96,15 +96,19 @@ def autoregressive_inference(params, ic, valid_data_full, model, device):
     valid_data = valid_data_full[ic:ic + prediction_length*dt:dt, in_channels, 0:H]
     valid_data = torch.as_tensor((valid_data - means)/stds).to(device, dtype=torch.float)
 
-    m = torch.as_tensor((np.load(params.time_means_path)[0][out_channels] - means)/stds)[:, 0:H]  # climatology
-    clim = m[None].to(device, dtype=torch.float)
+    clim = None   # no time_means file (the MERRA-2 config): RMSE only, no ACC
+    if params.time_means_path and os.path.isfile(params.time_means_path):
+      m = torch.as_tensor((np.load(params.time_means_path)[0][out_channels] - means)/stds)[:, 0:H]  # climatology
+      clim = m[None].to(device, dtype=torch.float)
     std = torch.as_tensor(stds[:, 0, 0]).to(device, dtype=torch.float)
     if params.orography:
       orog = torch.as_tensor(h5py.File(params.orography_path, 'r')['orog'][0:H])[None, None].to(device, dtype=torch.float)
 
     shape = (prediction_length, len(out_channels))
-    metrics = {k: torch.zeros(shape, device=device) for k in
-               ('rmse', 'acc', 'acc_unweighted', 'rmse_persistence', 'acc_persistence')}
+    keys = ('rmse', 'rmse_persistence')
+    if clim is not None:
+      keys += ('acc', 'acc_unweighted', 'acc_persistence')
+    metrics = {k: torch.zeros(shape, device=device) for k in keys}
     names = [params.channel_names[c] for c in out_channels]
     idx = names.index('z500') if 'z500' in names else 0   # the field inference.py reports
     persistence = valid_data[0:1]
@@ -116,13 +120,15 @@ def autoregressive_inference(params, ic, valid_data_full, model, device):
           future_pred = model(inp)
         tar = valid_data[i:i+1]
         metrics['rmse'][i] = weighted_rmse_torch_channels(future_pred, tar)[0] * std
-        metrics['acc'][i] = weighted_acc_torch_channels(future_pred-clim, tar-clim)[0]
-        metrics['acc_unweighted'][i] = unweighted_acc_torch_channels(future_pred-clim, tar-clim)[0]
         metrics['rmse_persistence'][i] = weighted_rmse_torch_channels(persistence, tar)[0] * std
-        metrics['acc_persistence'][i] = weighted_acc_torch_channels(persistence-clim, tar-clim)[0]
+        if clim is not None:
+          metrics['acc'][i] = weighted_acc_torch_channels(future_pred-clim, tar-clim)[0]
+          metrics['acc_unweighted'][i] = unweighted_acc_torch_channels(future_pred-clim, tar-clim)[0]
+          metrics['acc_persistence'][i] = weighted_acc_torch_channels(persistence-clim, tar-clim)[0]
         if params.log_to_screen:
           logging.info('Predicted timestep {} of {}. {} RMS Error: {}, ACC: {}'.format(
-              i, prediction_length, names[idx], metrics['rmse'][i, idx].item(), metrics['acc'][i, idx].item()))
+              i, prediction_length, names[idx], metrics['rmse'][i, idx].item(),
+              metrics['acc'][i, idx].item() if clim is not None else 'n/a'))
     return {k: v.cpu().numpy() for k, v in metrics.items()}
 
 

@@ -66,9 +66,10 @@ def main(argv=None):
             '\n> Warning: runs were scored on different initial conditions; persistence is from the first run.\n')
     text = (f"Mean over {len(summaries[0]['initial_conditions'])} initial conditions.{note}\n\n"
             '## RMSE (physical units, latitude weighted; lower is better)\n\n'
-            + table(summaries, 'rmse', args.channels, args.leads, min)
-            + '\n\n## ACC (latitude weighted; higher is better)\n\n'
-            + table(summaries, 'acc', args.channels, args.leads, max) + '\n')
+            + table(summaries, 'rmse', args.channels, args.leads, min) + '\n')
+    if all('acc' in s for s in summaries):   # runs scored without a climatology have no ACC
+        text += ('\n## ACC (latitude weighted; higher is better)\n\n'
+                 + table(summaries, 'acc', args.channels, args.leads, max) + '\n')
     print(text)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

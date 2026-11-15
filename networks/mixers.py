@@ -135,9 +135,12 @@ class GridAttention(nn.Module):
 _OPTIONS = {
     "afno": {"num_blocks", "sparsity_threshold", "hard_thresholding_fraction", "hidden_size_factor"},
     "vanilla": {"num_heads", "qkv_bias", "attn_drop", "proj_drop"},
-    "tucker_free": {"L", "p", "q", "r", "zero_init"},
-    "tucker_spectral": {"L", "kh", "kw", "r", "basis", "zero_init"},
-    "tucker_adaptive": {"L", "kh", "kw", "r", "ctx_hidden", "lat_basis", "gate_range", "zero_init"},
+    # `backend: gemm` (attention/tucker_gemm.py) is the same map through batched matrix
+    # products, the path every Tucker row of the paper uses; `compute_dtype` is its precision.
+    "tucker_free": {"L", "p", "q", "r", "zero_init", "backend", "compute_dtype"},
+    "tucker_spectral": {"L", "kh", "kw", "r", "basis", "zero_init", "backend", "compute_dtype"},
+    "tucker_adaptive": {"L", "kh", "kw", "r", "ctx_hidden", "lat_basis", "gate_range", "zero_init",
+                        "backend", "compute_dtype"},
 }
 
 

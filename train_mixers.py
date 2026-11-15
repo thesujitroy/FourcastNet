@@ -109,9 +109,13 @@ class Trainer():
       import wandb
       self.wandb = wandb
       config = json.loads(json.dumps(params.params, default=lambda o: o.tolist() if hasattr(o, 'tolist') else str(o)))
-      wandb.init(config=config, name=params.name, group=params.group, project=params.project,
-                 entity=params.entity, mode=os.getenv('WANDB_MODE', 'online'),
-                 tags=['era5', params.mixer['type']], resume='allow', id=params.wandb_id)
+      init = dict(config=config, name=params.name, group=params.group, project=params.project, entity=params.entity,
+                  tags=[params.get('dataset_tag', 'era5'), params.mixer['type']], resume='allow', id=params.wandb_id)
+      try:
+        wandb.init(mode=os.getenv('WANDB_MODE', 'online'), settings=wandb.Settings(init_timeout=180), **init)
+      except Exception as exc:  # a proxy or W&B outage must not kill the run (Helio job 312520 died this way)
+        logging.warning('wandb.init failed (%s); logging offline, upload later with `wandb sync wandb/offline-run-*`', exc)
+        wandb.init(mode='offline', **init)
       wandb.define_metric('valid_loss', summary='min')
 
     if 'precip' in params:
@@ -450,12 +454,13 @@ if __name__ == '__main__':
   params['enable_amp'] = args.enable_amp
 
   # W&B: one run per (config, run_num); a resumed job continues the same run
-  params['name'] = f"era5-{params.mixer['type'].replace('_', '-')}-{args.config}-{args.run_num}"
+  tag = params.get('dataset_tag', 'era5')   # 'merra2' in config/mixer_comparison_merra2.yaml
+  params['name'] = f"{tag}-{params.mixer['type'].replace('_', '-')}-{args.config}-{args.run_num}"
   params['group'] = params.wandb_group
   params['project'] = params.wandb_project
   params['entity'] = params.wandb_entity
   # stable across jobs (Python's hash() is salted per process), so a resubmitted job resumes the run
-  params['wandb_id'] = f"era5-{args.config}-{args.run_num}-" + hashlib.sha1(os.path.abspath(expDir).encode()).hexdigest()[:8]
+  params['wandb_id'] = f"{tag}-{args.config}-{args.run_num}-" + hashlib.sha1(os.path.abspath(expDir).encode()).hexdigest()[:8]
   if world_rank==0:
     logging_utils.log_to_file(logger_name=None, log_filename=os.path.join(expDir, 'out.log'))
     params.log()
