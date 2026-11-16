@@ -145,6 +145,32 @@ def main(argv=None):
                   f"{run['afno_einsum_dtype_under_bf16_autocast']}", flush=True)
             del ref
 
+        if params.mixer.get('basis') == 'dct' and params.mixer.get('backend', 'reference') != 'gemm':
+            # The DCT runs were trained on the reference path. The GEMM path is the same linear
+            # map, so the trained weights must give the same forecasts through it: check in fp32.
+            twin_params = Params(os.path.abspath(args.yaml_config), config)
+            twin_params['N_in_channels'] = len(twin_params.in_channels)
+            twin_params['N_out_channels'] = len(out)
+            twin_params['mixer'] = {**params.mixer, 'backend': 'gemm'}
+            twin = MixerNet(twin_params, img_size=(H, W), embed_dim=params.embed_dim, depth=params.depth).to(device)
+            twin.load_state_dict(state, strict=True)
+            twin.eval()
+            diff, peak, rel_ref, rel_twin = 0., 0., 0., 0.
+            with torch.no_grad():
+                for s in range(0, len(picks), args.batch):
+                    x, y = inp_all[s:s + args.batch].to(device), tar_all[s:s + args.batch].to(device)
+                    a, b = model(x).float(), twin(x).float()
+                    diff, peak = max(diff, float((a - b).abs().max())), max(peak, float(a.abs().max()))
+                    rel_ref += float(((a - y).flatten(1).norm(dim=1) / y.flatten(1).norm(dim=1)).sum())
+                    rel_twin += float(((b - y).flatten(1).norm(dim=1) / y.flatten(1).norm(dim=1)).sum())
+            run['gemm_backend_twin'] = {'state_dict_keys_equal': list(twin.state_dict()) == list(model.state_dict()),
+                                        'max_abs_difference': diff, 'max_abs_output': peak,
+                                        'relative_l2_reference': rel_ref / len(picks),
+                                        'relative_l2_gemm': rel_twin / len(picks)}
+            print(f"[{config}] trained weights through the GEMM DCT path vs the reference path (fp32): "
+                  f"{run['gemm_backend_twin']}", flush=True)
+            del twin
+
         for mode in ('fp32', 'bf16'):
             rmse, tot, ins, rel = 0., 0., 0., 0.
             with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=mode == 'bf16'):
