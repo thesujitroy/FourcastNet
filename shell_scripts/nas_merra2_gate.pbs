@@ -1,0 +1,82 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_m2_gate
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## Gate for the MERRA-2 mixer comparison, on one devel node (never on the pfe login nodes):
+##   1. pytest tests/test_merra2.py (converter, odd-row loader, the MERRA-2 config); the
+##      older suite tests/test_mixers.py runs beside the next steps
+##   2. data_process/merra2_to_fcn.py on real data: 1980 and 2020 first (enough for a smoke
+##      run, and a timing for the full conversion), more years in the background
+##   3. for every config, a 50-step 4-GPU run of train_mixers.py on those files, W&B offline,
+##      into expts/mixer_comparison_merra2_devel
+## Submit from FourCastNet/:   qsub shell_scripts/nas_merra2_gate.pbs
+## Logs: pbs_logs/m2_gate_<job id>/. The converted years are final and are kept.
+
+#PBS -l select=1:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -l place=scatter:excl
+#PBS -q gpu_devel@pbspl4
+#PBS -l walltime=02:00:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_m2_gate.out.temp
+#PBS -e pbs_logs/fcn_m2_gate.err.temp
+
+cd "$PBS_O_WORKDIR"
+JOB_ID=${PBS_JOBID%%.*}
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp pbs_logs/${JOB_ID}_${PBS_JOBNAME}.${ext}
+done
+. shell_scripts/nas_env.sh
+LOGS=pbs_logs/m2_gate_${JOB_ID}
+mkdir -p $LOGS
+OUT=${OUT:-/nobackupnfs1/sroy14/FourCastNet_MERRA2}
+YAML=config/mixer_comparison_merra2.yaml
+CONFIGS=${CONFIGS:-"afno tucker_free tucker_spectral tucker_spectral_dct tucker_adaptive"}
+DEVEL=$PWD/expts/mixer_comparison_merra2_devel
+RC=0
+
+echo "=== 1. pytest tests/test_merra2.py on $(hostname), $(date)"
+CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=8 python -m pytest -q -p no:cacheprovider tests/test_merra2.py > $LOGS/pytest_merra2.log 2>&1 || RC=1
+tail -n 25 $LOGS/pytest_merra2.log
+if [ $RC -ne 0 ]; then
+  echo "=== the MERRA-2 tests failed; not converting. rc=$RC $(date)"
+  exit $RC
+fi
+(CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=8 python -m pytest -q -p no:cacheprovider tests/test_mixers.py > $LOGS/pytest_mixers.log 2>&1; echo "rc=$?" >> $LOGS/pytest_mixers.log) &
+PYTEST_PID=$!
+
+echo "=== 2. conversion of 1980 and 2020, $(date)"
+(python data_process/merra2_to_fcn.py --out $OUT --years ${MORE_YEARS:-1981-1985,2023} --jobs 6 --no-stats > $LOGS/convert_more.log 2>&1; echo "rc=$?" >> $LOGS/convert_more.log) &
+MORE_PID=$!
+timeout 4200 python data_process/merra2_to_fcn.py --out $OUT --years 1980,2020 --jobs 2 > $LOGS/convert.log 2>&1 || RC=1
+cat $LOGS/convert.log
+tail -n 13 $OUT/logs/1980.log
+ls -l $OUT/train $OUT/test $OUT/stats 2>&1
+if [ $RC -ne 0 ]; then
+  echo "=== conversion did not finish; no smoke runs. rc=$RC $(date)"
+  wait $PYTEST_PID; tail -n 5 $LOGS/pytest_mixers.log
+  exit $RC
+fi
+
+nvidia-smi -L
+for config in $CONFIGS; do
+  echo "=== 3. smoke training: $config, $(date)"
+  rm -rf $DEVEL/$config
+  WANDB_MODE=offline timeout 1200 torchrun --standalone --nproc_per_node=4 train_mixers.py \
+      --yaml_config $YAML --config $config --run_num 0 --enable_amp \
+      --override max_epochs=1 max_iters_per_epoch=50 n_valid_samples=64 exp_dir=$DEVEL \
+                 wandb_group=merra2-fcn-mixer-comparison-devel \
+      > $LOGS/train_$config.log 2>&1 || { echo "FAILED: training $config"; RC=1; }
+  tail -n 4 $LOGS/train_$config.log
+  cat $DEVEL/$config/0/model.jsonl $DEVEL/$config/0/epochs.jsonl $DEVEL/$config/0/validation.jsonl 2>&1
+done
+
+wait $PYTEST_PID
+echo "=== tests/test_mixers.py:"; tail -n 5 $LOGS/pytest_mixers.log
+grep -q "^rc=0" $LOGS/pytest_mixers.log || RC=1
+echo "=== smoke done rc=$RC $(date); the background conversion keeps running until it ends or the walltime does"
+wait $MORE_PID
+tail -n 8 $LOGS/convert_more.log
+echo "=== done rc=$RC $(date)"
+exit $RC

@@ -137,10 +137,11 @@ _OPTIONS = {
     "vanilla": {"num_heads", "qkv_bias", "attn_drop", "proj_drop"},
     # `backend: gemm` (attention/tucker_gemm.py) is the same map through batched matrix
     # products, the path every Tucker row of the paper uses; `compute_dtype` is its precision.
-    "tucker_free": {"L", "p", "q", "r", "zero_init", "backend", "compute_dtype"},
-    "tucker_spectral": {"L", "kh", "kw", "r", "basis", "zero_init", "backend", "compute_dtype"},
+    # `term_norm: true` puts 1/L in front of the sum over the L terms (same parameters and init).
+    "tucker_free": {"L", "p", "q", "r", "zero_init", "backend", "compute_dtype", "term_norm"},
+    "tucker_spectral": {"L", "kh", "kw", "r", "basis", "zero_init", "backend", "compute_dtype", "term_norm"},
     "tucker_adaptive": {"L", "kh", "kw", "r", "ctx_hidden", "lat_basis", "gate_range", "zero_init",
-                        "backend", "compute_dtype"},
+                        "backend", "compute_dtype", "term_norm"},
 }
 
 

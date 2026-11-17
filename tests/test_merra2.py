@@ -226,6 +226,24 @@ def test_merra2_configs_differ_only_in_the_mixer():
     assert loaded['tucker_spectral_dct'].mixer['basis'] == 'dct'
 
 
+# The 1/L check: each Tucker config again with `term_norm: true` and nothing else changed.
+TERM_NORM = {'tucker_free_termnorm': 'tucker_free', 'tucker_spectral_termnorm': 'tucker_spectral',
+             'tucker_spectral_dct_gemm_termnorm': 'tucker_spectral_dct_gemm',
+             'tucker_adaptive_termnorm': 'tucker_adaptive'}
+
+
+@pytest.mark.parametrize('normed,plain', list(TERM_NORM.items()))
+def test_term_norm_configs_are_the_plain_configs_plus_one_over_L(normed, plain):
+    from networks.mixers import build_mixer
+    a, b = Params(CONFIG, normed), Params(CONFIG, plain)
+    differing = {k for k in set(a.params) | set(b.params) if a.params.get(k) != b.params.get(k)}
+    assert differing == {'mixer'}
+    assert a.mixer == {**b.mixer, 'term_norm': True}
+    assert a.mixer['backend'] == 'gemm'
+    assert build_mixer(a.mixer, a.embed_dim, (45, 72))[0].term_norm is True
+    assert build_mixer(b.mixer, b.embed_dim, (45, 72))[0].term_norm is False
+
+
 def test_merra2_config_matches_the_converter_and_fourcastnet():
     p = Params(CONFIG, 'afno')
     assert p.channel_names == m2f.CHANNEL_NAMES and len(p.in_channels) == len(p.out_channels) == 20

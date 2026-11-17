@@ -4,6 +4,7 @@
 ##   1 node rank  2 num nodes  3 world size  4 rdzv addr  5 rdzv port  6 rdzv id
 ##   7 PBS job id  8 TMPDIR  9 GPUs per node  10 config name (config/mixer_comparison.yaml)
 ##   11 run number  12 mode: full | devel  13 optional time limit in seconds (0 = none)
+##   14 optional yaml config (default config/mixer_comparison.yaml)
 
 export NODE_RANK=$1
 export NUM_NODES=$2
@@ -18,16 +19,19 @@ CONFIG=${10:-afno}
 RUN_NUM=${11:-0}
 MODE=${12:-full}
 TIME_LIMIT=${13:-0}
+YAML=${14:-config/mixer_comparison.yaml}       # config/mixer_comparison_merra2.yaml for the MERRA-2 runs
+NAME=$(basename "$YAML" .yaml)
 
 . shell_scripts/nas_env.sh
 
 sleep 5
-echo "node $NODE_RANK of $NUM_NODES, world $WORLD_SIZE, rdzv $RDZV_ADDR:$RDZV_PORT, config $CONFIG run $RUN_NUM ($MODE), dir $PWD"
+echo "node $NODE_RANK of $NUM_NODES, world $WORLD_SIZE, rdzv $RDZV_ADDR:$RDZV_PORT, config $YAML:$CONFIG run $RUN_NUM ($MODE), dir $PWD"
 
 ## devel: a few hundred steps into a separate exp_dir, never mixed with the real runs
 OVERRIDE=
 if [ "$MODE" = "devel" ]; then
-  OVERRIDE="--override max_epochs=1 max_iters_per_epoch=50 n_valid_samples=64 exp_dir=$PWD/expts/mixer_comparison_devel wandb_group=era5-mixer-comparison-devel"
+  GROUP=era5-mixer-comparison; [ "$NAME" = "mixer_comparison_merra2" ] && GROUP=merra2-fcn-mixer-comparison
+  OVERRIDE="--override max_epochs=1 max_iters_per_epoch=50 n_valid_samples=64 exp_dir=$PWD/expts/${NAME}_devel wandb_group=${GROUP}-devel"
 fi
 LIMIT=
 if [ "$TIME_LIMIT" -gt 0 ]; then
@@ -42,7 +46,7 @@ $LIMIT torchrun \
   --rdzv_endpoint="$RDZV_ADDR:$RDZV_PORT" \
   --rdzv_backend=c10d \
   train_mixers.py \
-  --yaml_config config/mixer_comparison.yaml \
+  --yaml_config $YAML \
   --config $CONFIG \
   --run_num $RUN_NUM \
   --enable_amp \

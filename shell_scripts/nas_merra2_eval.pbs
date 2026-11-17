@@ -1,0 +1,72 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_m2_eval
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## Rollout evaluation of the trained MERRA-2 mixer runs (inference/inference_mixers.py): 10-day
+## rollouts from an initial condition every 9 days of the out-of-sample year, RMSE and ACC
+## against MERRA-2 and persistence (RMSE only: no climatology), then one comparison table
+## (scripts/summarize_rollouts.py) in results/merra2_mixer_rollouts.md. One GPU per config. Submit from FourCastNet/
+## once the training jobs have ended (do not chain with -W depend: dependent jobs stay in system hold here):
+##   qsub shell_scripts/nas_merra2_eval.pbs
+##   qsub -v CONFIGS="afno tucker_spectral" shell_scripts/nas_merra2_eval.pbs
+
+#PBS -l select=1:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -q gpu_normal@pbspl4
+#PBS -l walltime=04:00:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_m2_eval.out.temp
+#PBS -e pbs_logs/fcn_m2_eval.err.temp
+
+cd "$PBS_O_WORKDIR"
+JOB_ID=${PBS_JOBID%%.*}
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp pbs_logs/${JOB_ID}_${PBS_JOBNAME}.${ext}
+done
+
+. shell_scripts/nas_env.sh
+nvidia-smi -L
+
+CONFIGS=${CONFIGS:-"afno tucker_free tucker_spectral tucker_spectral_dct tucker_adaptive"}
+## Patch-2 runs: -v YAML=config/mixer_comparison_merra2_p2.yaml,EXPT=expts/merra2_mixer_comparison_p2,RESULT=results/merra2_p2_mixer_rollouts.md
+YAML=${YAML:-config/mixer_comparison_merra2.yaml}
+EXPT=${EXPT:-expts/merra2_mixer_comparison}            # the config's exp_dir, searched for the summaries
+RESULT=${RESULT:-results/merra2_mixer_rollouts.md}
+RUN_NUM=${RUN_NUM:-0}
+NGPU=$(nvidia-smi -L | wc -l)
+mkdir -p results pbs_logs/eval_${JOB_ID}
+
+## Freshly allocated mil_a100 nodes often answer "CUDA-capable device(s) is/are busy or
+## unavailable" for the first minute: touch every GPU, retrying, before starting the rollouts.
+for attempt in 1 2 3 4 5 6; do
+  if timeout 180 python -c "import torch; n = torch.cuda.device_count(); assert n == $NGPU, n; [torch.ones(1, device=f'cuda:{i}').item() for i in range(n)]" \
+      > pbs_logs/eval_${JOB_ID}/probe.log 2>&1; then
+    break
+  fi
+  echo "GPU probe attempt $attempt/6 failed: $(tail -n 1 pbs_logs/eval_${JOB_ID}/probe.log)"
+  [ $attempt -eq 6 ] && { echo "GPUs unusable, giving up"; exit 3; }
+  sleep 30
+done
+
+i=0
+PIDS=()
+for config in $CONFIGS; do
+  GPU=$((i % NGPU))
+  echo "=== GPU $GPU: $config run $RUN_NUM"
+  CUDA_VISIBLE_DEVICES=$GPU python inference/inference_mixers.py --yaml_config $YAML --config $config --run_num $RUN_NUM \
+      > pbs_logs/eval_${JOB_ID}/$config.log 2>&1 &
+  PIDS+=($!)
+  i=$((i + 1))
+  # more configs than GPUs on this node: wait for this batch first
+  if [ $((i % NGPU)) -eq 0 ]; then
+    for pid in ${PIDS[@]}; do wait $pid; done
+    PIDS=()
+  fi
+done
+for pid in ${PIDS[@]}; do wait $pid; done
+tail -n 2 pbs_logs/eval_${JOB_ID}/*.log
+
+python scripts/summarize_rollouts.py $EXPT --output $RESULT \
+    --channels h_l51 t_l63 t2m u10 v10 slp tqv
+echo "Done with PBS"

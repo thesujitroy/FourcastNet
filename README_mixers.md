@@ -95,3 +95,55 @@ mixers, every mixer's training and state-dict round trip, bf16 behaviour, and co
 controls. It also runs end-to-end training, resume, a 2-rank torchrun run and
 inference on a synthetic FourCastNet-format dataset, plus the benchmark. FourCastNet
 and HelioFM both have a top-level `utils` package, so the two suites run separately.
+
+## MERRA-2 (the Prithvi WxC data)
+
+The same comparison on MERRA-2, because the ERA5 files are not readable yet. FourCastNet's
+backbone and recipe are unchanged (patch 8, embed 768, depth 12, 8 AFNO blocks, Adam 5e-4,
+cosine schedule, batch 64, relative L2 loss) and trained from scratch; the network takes its
+grid from the data. Config: `config/mixer_comparison_merra2.yaml`.
+
+**Data.** `data_process/merra2_to_fcn.py` rewrites the daily MERRA-2 files into FourCastNet's
+year-file layout under `/nobackupnfs1/sroy14/FourCastNet_MERRA2/` (about 1.1 TB):
+
+- 20 channels, the MERRA-2 counterparts of FourCastNet's 20 variables in the same order:
+  `u10 v10 t2m sp slp t_l63 u_l72 v_l72 h_l72 u_l63 v_l63 h_l63 u_l51 v_l51 h_l51 t_l51 h_l34
+  qv_l51 qv_l63 tqv`. `_lNN` is MERRA-2 model level NN (72 ~ 985 hPa, 63 ~ 850, 51 ~ 525,
+  34 ~ 50), not a pressure level; `h` is geopotential height in m; `qv` is specific humidity
+  (MERRA-2 has no relative humidity).
+- 6-hourly (00, 06, 12, 18 UTC), 365 days per year (31 December of a leap year is dropped,
+  the loader needs one length for all files): `fields` is (1460, 20, 361, 576).
+- train 1980-2019, test 2020-2022 (validation during training), out_of_sample 2023 (rollouts).
+- rows run south to north; the loader drops the last one (the north pole): 360 x 576, a
+  45 x 72 token grid at patch 8.
+- `stats/global_means.npy`, `global_stds.npy` over the training years; `stats/channels.json`
+  lists them with the value ranges. No climatology file, so validation and rollouts report
+  RMSE only, no ACC.
+
+**Mixers.** AFNO on the 45 x 72 grid mixes every latitude mode and zonal wavenumbers 0..22.
+The spectral Tucker maps retain exactly that band.
+
+| config | mixer |
+|---|---|
+| `afno` | FourCastNet's AFNO2D, the baseline |
+| `tucker_free` | free Tucker, L=4 p=q=32 r=128, GEMM |
+| `tucker_spectral` | spectral Tucker, DFT, L=4 kh=kw=23 r=128, GEMM |
+| `tucker_spectral_dct` | spectral Tucker, DCT, kh=45 kw=46 (the same band), reference backend |
+| `tucker_adaptive` | adaptive spectral Tucker (gate, latitude profile), kh=kw=23, GEMM |
+
+**Running (from `FourCastNet/`).**
+
+```bash
+qsub shell_scripts/nas_merra2_gate.pbs      # tests, a sample conversion, 50-step smoke runs (devel queue)
+qsub shell_scripts/nas_merra2_convert.pbs   # all 44 years; resumable, never two at once
+for k in afno tucker_free tucker_spectral tucker_spectral_dct tucker_adaptive; do
+  qsub -N fcn_m2_$k -o pbs_logs/fcn_m2_$k.out.temp -e pbs_logs/fcn_m2_$k.err.temp \
+       -v CONFIG=$k shell_scripts/nas_merra2_train.pbs          # one node each
+done
+qsub -W depend=afterany:<job ids> shell_scripts/nas_merra2_eval.pbs
+```
+
+A `-v` value with commas (for example `YEARS=1980-1999,2023`) must be passed by name:
+`env -i PATH=$PATH HOME=$HOME USER=$USER LOGNAME=$USER YEARS=1980-1999,2023 /PBS/bin/qsub -v YEARS ...`.
+Runs land in `expts/merra2_mixer_comparison/<config>/<run>/` with the same record files as
+above; W&B group `merra2-fcn-mixer-comparison`. Rollouts write `results/merra2_mixer_rollouts.md`.

@@ -1,0 +1,91 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_m2_bench
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## Cost benchmark (scripts/benchmark_mixers.py) of the five MERRA-2 mixer configs on the
+## training grid 360 x 576, at patch 8 (45 x 72 tokens, GPU 0) and patch 2 (180 x 288 tokens,
+## GPU 1): parameters, forward FLOPs, inference and training-step latency and peak GPU memory,
+## for one mixer on the token grid and for the whole model. Synthetic input already on the GPU
+## (no data, no trained weights), bf16 autocast as in training.
+## Submit from FourCastNet/:   qsub shell_scripts/nas_merra2_benchmark.pbs
+## Rows: results/merra2_benchmark/<job id>/{p8,p2}/measurements.jsonl; mean +- std over the
+## seeds: results/merra2_benchmark/<job id>/{p8,p2}/summary.tsv.
+
+#PBS -l select=1:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -q gpu_devel@pbspl4
+#PBS -l walltime=01:30:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_m2_bench.out.temp
+#PBS -e pbs_logs/fcn_m2_bench.err.temp
+
+cd "$PBS_O_WORKDIR"
+JOB_ID=${PBS_JOBID%%.*}
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp pbs_logs/${JOB_ID}_${PBS_JOBNAME}.${ext}
+done
+
+. shell_scripts/nas_env.sh
+nvidia-smi -L
+
+CONFIGS=${CONFIGS:-"afno tucker_free tucker_spectral tucker_spectral_dct tucker_adaptive"}
+SEEDS=${SEEDS:-"0 1 2"}
+BATCH_SIZES=${BATCH_SIZES:-"1 2"}
+OUT=results/merra2_benchmark/${JOB_ID}
+mkdir -p $OUT
+
+## Freshly allocated mil_a100 nodes often answer "CUDA-capable device(s) is/are busy or
+## unavailable" for the first minute: touch both GPUs, retrying, before starting.
+for attempt in 1 2 3 4 5 6; do
+  if timeout 180 python -c "import torch; [torch.ones(1, device=f'cuda:{i}').item() for i in range(2)]" \
+      > $OUT/probe.log 2>&1; then
+    break
+  fi
+  echo "GPU probe attempt $attempt/6 failed: $(tail -n 1 $OUT/probe.log)"
+  [ $attempt -eq 6 ] && { echo "GPUs unusable, giving up"; exit 3; }
+  sleep 30
+done
+
+GPU=0
+PIDS=()
+for tag in p8:config/mixer_comparison_merra2.yaml p2:config/mixer_comparison_merra2_p2.yaml; do
+  name=${tag%%:*}
+  mkdir -p $OUT/$name
+  CUDA_VISIBLE_DEVICES=$GPU python scripts/benchmark_mixers.py --yaml-config ${tag#*:} --configs $CONFIGS \
+      --img-size 360 576 --batch-sizes $BATCH_SIZES --scope both --device cuda --seeds $SEEDS \
+      --output $OUT/$name > $OUT/$name/run.log 2>&1 &
+  PIDS+=($!)
+  GPU=$((GPU + 1))
+done
+RC=0
+for pid in ${PIDS[@]}; do wait $pid || RC=1; done
+
+for name in p8 p2; do
+  echo "=== $name"
+  grep -h -E ': (ok|oom|error)$' $OUT/$name/run.log | sort | uniq -c
+  tail -n 3 $OUT/$name/run.log | cut -c1-300
+  ## mean over the seeds per (config, scope, batch); grouped by config name because the DFT
+  ## and DCT spectral configs share one mixer type (HelioFM's seed summary would merge them)
+  ## (python, not jq: jq is not installed on the compute nodes)
+  python - $OUT/$name/measurements.jsonl > $OUT/$name/summary.tsv <<'EOF' || RC=1
+import json, sys
+from collections import defaultdict
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+groups = defaultdict(list)
+for r in rows:
+    if r.get("status") == "ok":
+        groups[(r["scope"], r["batch_size"], r["config"])].append(r)
+mean = lambda g, k: sum(r[k] for r in g) / len(g)
+for (scope, batch, config), g in sorted(groups.items()):
+    print(scope, batch, config, len(g), g[0]["tokens"], g[0]["parameters/total"], g[0]["parameters/attention"],
+          round(g[0]["flops/forward_per_sample"] / 1e9, 2),
+          round(mean(g, "inference/latency_ms_p50"), 1), round(mean(g, "train/latency_ms_p50"), 1),
+          round(mean(g, "inference/peak_allocated_bytes") / 1e9, 2), round(mean(g, "train/peak_allocated_bytes") / 1e9, 2),
+          sep="\t")
+EOF
+  echo "scope batch config n tokens params mixer_params GFLOPs/sample infer_ms train_ms infer_GB train_GB"
+  cat $OUT/$name/summary.tsv
+done
+echo "Done with PBS (rc=$RC)"
+exit $RC

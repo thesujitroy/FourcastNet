@@ -1,0 +1,148 @@
+### FourCastNet mixer comparison on MERRA-2 (train_mixers.py, inference/inference_mixers.py) ###
+#
+# FourCastNet's AFNO backbone, unchanged (patch 8, embed 768, depth 12, 8 AFNO blocks),
+# trained from scratch on the MERRA-2 data Prithvi WxC uses, against the same backbone with
+# the AFNO token mixer replaced by a Tucker map. One base, then one named config per mixer
+# that overrides ONLY `mixer` (tests/test_merra2.py checks this), so any difference in
+# results comes from the token mixer.
+#
+# Data: data_process/merra2_to_fcn.py writes FourCastNet's year-file layout from the daily
+# MERRA-2 files: 20 channels, 6-hourly, 361 x 576 (the loader drops the last row -> 360 x 576,
+# a 45 x 72 token grid at patch 8). No climatology file: ACC is not computed, RMSE is.
+#
+#   python train_mixers.py --yaml_config config/mixer_comparison_merra2.yaml --config afno --enable_amp
+#   qsub -v CONFIG=afno shell_scripts/nas_merra2_train.pbs
+
+mixer_base: &base
+  dataset_tag: 'merra2'       # prefix of the W&B run names and ids
+
+  # ---- FourCastNet afno_backbone settings (config/AFNO.yaml), unchanged ----
+  loss: 'l2'
+  lr: 5.0e-4
+  scheduler: 'CosineAnnealingLR'
+  dt: 1                       # one 6 h step
+  n_history: 0
+  prediction_type: 'iterative'
+  prediction_length: 41       # inference: 41 x 6 h = 10 days
+  n_initial_conditions: 5
+  ics_type: "default"
+  save_raw_forecasts: !!bool False
+  save_channel: !!bool False
+  masked_acc: !!bool False
+  maskpath: None
+  perturb: !!bool False
+  add_grid: !!bool False
+  N_grid_channels: 0
+  gridtype: 'sinusoidal'
+  roll: !!bool False
+  batch_size: 64              # global; divided by the number of GPUs
+  num_blocks: 8               # AFNO block-diagonal blocks
+  patch_size: 8
+  target: 'default'
+  in_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  out_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  normalization: 'zscore'
+  orography: !!bool False
+  orography_path: None
+  log_to_screen: !!bool True
+  log_to_wandb: !!bool True
+  save_checkpoint: !!bool True
+  enable_nhwc: !!bool False
+  optimizer_type: 'Adam'      # upstream FusedAdam (apex) is the same update rule; apex is not installed on NAS
+  crop_size_x: None
+  crop_size_y: None
+  two_step_training: !!bool False
+  plot_animations: !!bool False
+  add_noise: !!bool False
+  noise_std: 0
+
+  # ---- data: MERRA-2 in FourCastNet's layout (data_process/merra2_to_fcn.py) ----
+  # year files with `fields` of shape (1460, 20, 361, 576) at 6 h, rows south to north
+  train_data_path:   '/nobackupnfs1/sroy14/FourCastNet_MERRA2/train'            # 1980-2019
+  valid_data_path:   '/nobackupnfs1/sroy14/FourCastNet_MERRA2/test'             # 2020-2022
+  inf_data_path:     '/nobackupnfs1/sroy14/FourCastNet_MERRA2/out_of_sample'    # 2023
+  global_means_path: '/nobackupnfs1/sroy14/FourCastNet_MERRA2/stats/global_means.npy'
+  global_stds_path:  '/nobackupnfs1/sroy14/FourCastNet_MERRA2/stats/global_stds.npy'
+  time_means_path:   None     # no climatology: validation logs RMSE only, no ACC
+  exp_dir: '/nobackupnfs1/sroy14/sujit_home/Tucker_map/FourCastNet/expts/merra2_mixer_comparison'
+  num_data_workers: 12        # per GPU; a sample is two 16.6 MB reads and the runs are data-bound
+  # the MERRA-2 counterparts of FourCastNet's 20 variables, same positions:
+  #   u10 v10 t2m sp msl t850 u1000 v1000 z1000 u850 v850 z850 u500 v500 z500 t500 z50 r500 r850 tcwv
+  # `_lNN` is MERRA-2 model level NN (72 ~ 985 hPa, 63 ~ 850, 51 ~ 525, 34 ~ 50); h is
+  # geopotential height in m, qv specific humidity, tqv total column water vapour
+  channel_names: ['u10', 'v10', 't2m', 'sp', 'slp', 't_l63', 'u_l72', 'v_l72', 'h_l72', 'u_l63',
+                  'v_l63', 'h_l63', 'u_l51', 'v_l51', 'h_l51', 't_l51', 'h_l34', 'qv_l51', 'qv_l63', 'tqv']
+
+  # ---- comparison settings (identical for every mixer) ----
+  max_epochs: 10              # 40 years x 1460 steps / batch 64 = 912 steps per epoch, 9.1k in all
+  max_iters_per_epoch: None   # cap steps per epoch (devel runs); None = full epoch
+  embed_dim: 768
+  depth: 12
+  seed: 42                    # initial weights and training-sample order
+  amp_dtype: 'bfloat16'       # with --enable_amp
+  n_valid_samples: 256        # fixed, evenly spaced over the test years, same for every run and epoch
+  save_valid_images: !!bool False
+  wandb_log_every: 10         # steps between step_loss points
+  wandb_entity: 'nasa-impact'
+  wandb_project: 'StR World Model'
+  wandb_group: 'merra2-fcn-mixer-comparison'
+  mixer: {type: afno}
+
+# ---------------------------------------------------------------- the mixers
+# AFNO on the 45 x 72 token grid mixes every latitude mode and the zonal wavenumbers 0..22
+# (afnonet.py keeps H // 2 + 1 = 23 of the 37 rfft columns). The spectral Tucker maps retain
+# exactly that band: DFT kh = kw = 23 is |m|, |n| <= 22; a DCT index is half a DFT
+# wavenumber, so the same band is kh = 45 (all rows) and kw = 46. Ranks are the Helio and
+# Prithvi ones (L = 4, r = 128). GEMM backend; tucker_spectral_dct is the earlier reference-path DCT run.
+
+afno:
+  <<: *base
+  mixer: {type: afno}         # FourCastNet itself: num_blocks 8, sparsity 0.01
+
+tucker_free:
+  <<: *base
+  mixer: {type: tucker_free, L: 4, p: 32, q: 32, r: 128, zero_init: false, backend: gemm}
+
+tucker_spectral:
+  <<: *base
+  mixer: {type: tucker_spectral, L: 4, kh: 23, kw: 23, r: 128, basis: dft, zero_init: false, backend: gemm}
+
+tucker_spectral_dct:
+  <<: *base
+  mixer: {type: tucker_spectral, L: 4, kh: 45, kw: 46, r: 128, basis: dct, zero_init: false}
+
+# The same DCT map on the GEMM backend (attention/tucker_gemm.py::spectral_dct_gemm): identical
+# parameters, so the tucker_spectral_dct checkpoints load into it. The DCT row of the paper.
+tucker_spectral_dct_gemm:
+  <<: *base
+  mixer: {type: tucker_spectral, L: 4, kh: 45, kw: 46, r: 128, basis: dct, zero_init: false, backend: gemm}
+
+tucker_adaptive:
+  <<: *base
+  mixer: {type: tucker_adaptive, L: 4, kh: 23, kw: 23, r: 128, ctx_hidden: 64, lat_basis: 8,
+          gate_range: 1.0, zero_init: false, backend: gemm}
+
+# ---------------------------------------------------------------- the 1/L check
+# The paper writes every Tucker map with 1/L in front of the sum over the L terms; the runs
+# above train the plain sum (the factor is absorbed into B_C, whose init has variance 1/(rL)).
+# These four are the configs above with the factor written out (`term_norm: true`) and nothing
+# else changed: same init, optimizer and schedule, all on the GEMM backend. Compare each with
+# its plain twin (DCT with tucker_spectral_dct_gemm).
+tucker_free_termnorm:
+  <<: *base
+  mixer: {type: tucker_free, L: 4, p: 32, q: 32, r: 128, zero_init: false, backend: gemm, term_norm: true}
+
+tucker_spectral_termnorm:
+  <<: *base
+  mixer: {type: tucker_spectral, L: 4, kh: 23, kw: 23, r: 128, basis: dft, zero_init: false, backend: gemm,
+          term_norm: true}
+
+tucker_spectral_dct_gemm_termnorm:
+  <<: *base
+  mixer: {type: tucker_spectral, L: 4, kh: 45, kw: 46, r: 128, basis: dct, zero_init: false, backend: gemm,
+          term_norm: true}
+
+tucker_adaptive_termnorm:
+  <<: *base
+  mixer: {type: tucker_adaptive, L: 4, kh: 23, kw: 23, r: 128, ctx_hidden: 64, lat_basis: 8,
+          gate_range: 1.0, zero_init: false, backend: gemm, term_norm: true}

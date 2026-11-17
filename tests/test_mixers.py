@@ -168,6 +168,28 @@ def test_invalid_mixer_options_fail(cfg):
         MixerNet(params(cfg), **SMALL)
 
 
+@pytest.mark.parametrize('kind', ['tucker_free', 'tucker_spectral', 'tucker_adaptive'])
+def test_term_norm_divides_the_tucker_mixer_output_by_L(kind):
+    """`term_norm: true` is the 1/L in front of the sum over the L terms: same parameters,
+    output divided by L."""
+    from networks.mixers import build_mixer
+    cfg = MIXERS[kind]
+    plain, _ = build_mixer(cfg, 32, (4, 8))
+    normed, _ = build_mixer({**cfg, 'term_norm': True}, 32, (4, 8))
+    assert normed.term_norm is True and plain.term_norm is False
+    assert list(normed.state_dict()) == list(plain.state_dict())
+    normed.load_state_dict(plain.state_dict(), strict=True)
+    x = torch.randn(2, 4, 8, 32)
+    with torch.no_grad():
+        torch.testing.assert_close(normed(x), plain(x) / cfg['L'], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize('kind', ['afno', 'vanilla'])
+def test_term_norm_is_refused_for_mixers_without_terms(kind):
+    with pytest.raises(ValueError):
+        MixerNet(params({**MIXERS[kind], 'term_norm': True}), **SMALL)
+
+
 # ---------------------------------------------------------------- configs
 from pathlib import Path  # noqa: E402
 

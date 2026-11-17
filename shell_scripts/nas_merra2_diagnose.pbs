@@ -1,0 +1,49 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_m2_diag
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## Checks on the trained MERRA-2 mixer runs (scripts/diagnose_merra2_runs.py): the afno
+## checkpoint against upstream AFNONet, one 6 h step of every config in fp32 and under bf16
+## autocast against persistence, and where the 6 h error sits (inside patches or not).
+## One GPU, a few minutes. Submit from FourCastNet/:   qsub shell_scripts/nas_merra2_diagnose.pbs
+
+#PBS -l select=1:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -q gpu_devel@pbspl4
+#PBS -l walltime=00:40:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_m2_diag.out.temp
+#PBS -e pbs_logs/fcn_m2_diag.err.temp
+
+cd "$PBS_O_WORKDIR"
+JOB_ID=${PBS_JOBID%%.*}
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp pbs_logs/${JOB_ID}_${PBS_JOBNAME}.${ext}
+done
+
+. shell_scripts/nas_env.sh
+NGPU=$(nvidia-smi -L | wc -l)
+mkdir -p results pbs_logs/diag_${JOB_ID}
+
+## Freshly allocated mil_a100 nodes often answer "CUDA-capable device(s) is/are busy or
+## unavailable" for the first minute: touch the GPU, retrying, before starting.
+for attempt in 1 2 3 4 5 6; do
+  if CUDA_VISIBLE_DEVICES=0 timeout 180 python -c "import torch; torch.ones(1, device='cuda:0').item()" \
+      > pbs_logs/diag_${JOB_ID}/probe.log 2>&1; then
+    break
+  fi
+  echo "GPU probe attempt $attempt/6 failed: $(tail -n 1 pbs_logs/diag_${JOB_ID}/probe.log)"
+  [ $attempt -eq 6 ] && { echo "GPU unusable, giving up"; exit 3; }
+  sleep 30
+done
+
+## Patch-2 runs, error split on the same 8 x 8 blocks as the patch-8 report:
+##   qsub -v ARGS="--yaml_config config/mixer_comparison_merra2_p2.yaml --split_patch 8 --batch 4",OUTPUT=results/merra2_p2_diagnose.json ...
+OUTPUT=${OUTPUT:-results/merra2_diagnose.json}
+CUDA_VISIBLE_DEVICES=0 python scripts/diagnose_merra2_runs.py $ARGS --output $OUTPUT \
+    > pbs_logs/diag_${JOB_ID}/diagnose.log 2>&1
+RC=$?
+cat pbs_logs/diag_${JOB_ID}/diagnose.log
+echo "Done with PBS (rc=$RC)"
+exit $RC

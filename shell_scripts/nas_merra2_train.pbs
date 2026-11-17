@@ -1,0 +1,131 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_m2_train
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## One run of the MERRA-2 mixer comparison (train_mixers.py, config/mixer_comparison_merra2.yaml)
+## on one mil_a100 node: 4 GPUs, global batch 64 -> 16 samples per GPU on the 45 x 72 token grid.
+## The mixer is chosen at submit time; matching -N/-o/-e keep parallel jobs' logs apart.
+## Submit from FourCastNet/:
+##   for k in afno tucker_free tucker_spectral tucker_spectral_dct tucker_adaptive; do
+##     qsub -N fcn_m2_$k -o pbs_logs/fcn_m2_$k.out.temp -e pbs_logs/fcn_m2_$k.err.temp \
+##          -v CONFIG=$k shell_scripts/nas_merra2_train.pbs
+##   done
+## Devel run (1 epoch x 50 steps into expts/mixer_comparison_merra2_devel):
+##   qsub -q gpu_devel@pbspl4 -l walltime=01:00:00 -v CONFIG=afno,MODE=devel shell_scripts/nas_merra2_train.pbs
+## More nodes: -l select=2:model=mil_a100:ncpus=64:ngpus=4:mem=480GB -v CONFIG=afno,NUM_NODES=2
+##   (NUM_NODES x GPUS_PER_NODE must divide the batch of 64; select= may request spare nodes).
+## gh200 nodes (aarch64, one GPU each): -l select=4:model=gh200:ncpus=48:ngpus=1:mem=480GB
+##   -v CONFIG=afno,NUM_NODES=4,GPUS_PER_NODE=1 and the gh200 queue.
+## The job exits with the head node's torchrun exit code. A resubmitted run resumes from
+## expts/merra2_mixer_comparison/<config>/<run>/training_checkpoints/ckpt.tar (written every
+## epoch). Keep max_epochs fixed across resubmissions: the cosine schedule is tied to it.
+
+#PBS -l select=1:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -l place=scatter:excl
+#PBS -q gpu_normal@pbspl4
+#PBS -l walltime=12:00:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_m2_train.out.temp
+#PBS -e pbs_logs/fcn_m2_train.err.temp
+
+cd "$PBS_O_WORKDIR"
+
+NUM_NODES=${NUM_NODES:-1}                        # nodes the run uses; select= may request spares
+GPUS_PER_NODE=${GPUS_PER_NODE:-4}                # must match ngpus= in the select above
+RETRY=${RETRY:-0}                                # set by the self-resubmit below when the GPU probe fails
+MAX_RETRY=${MAX_RETRY:-5}
+CONFIG=${CONFIG:?submit with -v CONFIG=<afno|tucker_free|tucker_spectral|tucker_spectral_dct|tucker_adaptive>}
+RUN_NUM=${RUN_NUM:-0}
+MODE=${MODE:-full}
+TIME_LIMIT=${TIME_LIMIT:-0}
+YAML=${YAML:-config/mixer_comparison_merra2.yaml}
+
+export BASE=$PWD
+export MASTER_PORT=$(shuf -i 20000-65000 -n 1)
+export WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
+JOB_ID=$PBS_JOBID
+
+echo "JOB ID is ${JOB_ID}, config ${YAML}:${CONFIG}, run ${RUN_NUM}, mode ${MODE}"
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp "pbs_logs/${JOB_ID%%.*}_${PBS_JOBNAME}.${ext}"
+done
+
+ORIG_HEAD=$(head -n1 $PBS_NODEFILE)
+NODES=($(sort -u $PBS_NODEFILE))
+echo cluster nodes: ${NODES[@]}
+if [[ ${#NODES[@]} -lt "$NUM_NODES" ]]; then
+    echo "Aborting, NUM_NODES=$NUM_NODES but only ${#NODES[@]} nodes allocated"
+    exit 2
+fi
+
+## GPU probe (as weather-fm's nas_mixer_train.pbs): touch every GPU on every node; run on the
+## first NUM_NODES good nodes (the head node first when it is good); if too few are good,
+## resubmit this job unchanged. Freshly allocated mil_a100 nodes often answer "CUDA-capable
+## device(s) is/are busy or unavailable" for the first minute, so each node gets PROBE_TRIES
+## attempts PROBE_GAP s apart. The last attempt's output is kept in pbs_logs/probe_<job>_<node>.log.
+PROBE_TRIES=${PROBE_TRIES:-4}
+PROBE_GAP=${PROBE_GAP:-30}
+probe_node() {
+  local node=$1 attempt log=pbs_logs/probe_${JOB_ID%%.*}_$1.log
+  for attempt in $(seq 1 $PROBE_TRIES); do
+    if ssh -o StrictHostKeyChecking=no -i $HOME/.ssh/id_rsa $node "cd $BASE; . shell_scripts/nas_env.sh >/dev/null 2>&1; timeout 180 python -c \"import torch; n = torch.cuda.device_count(); assert n == $GPUS_PER_NODE, n; [torch.ones(1, device=f'cuda:{i}').item() for i in range(n)]\"" > $log 2>&1; then
+      return 0
+    fi
+    echo "GPU probe attempt $attempt/$PROBE_TRIES failed on $node: $(tail -n 1 $log 2>/dev/null)"
+    [[ $attempt -lt $PROBE_TRIES ]] && sleep $PROBE_GAP
+  done
+  return 1
+}
+GOOD=()
+for node in ${NODES[@]}; do
+  if probe_node $node; then
+    [[ $node == $ORIG_HEAD ]] && GOOD=($node ${GOOD[@]}) || GOOD+=($node)
+  else
+    echo "GPU probe FAILED on $node"
+  fi
+done
+echo "usable nodes: ${GOOD[@]}"
+if [[ ${#GOOD[@]} -lt "$NUM_NODES" ]]; then
+  echo "only ${#GOOD[@]} of ${#NODES[@]} nodes usable, need $NUM_NODES (retry $RETRY of $MAX_RETRY)"
+  if [[ $RETRY -lt $MAX_RETRY ]]; then
+    QF=$(qstat -f $PBS_JOBID | tr -d '\n\t')
+    SEL=$(echo "$QF" | grep -o 'Resource_List.select = [^ ]*' | cut -d' ' -f3)
+    WT=$(echo "$QF" | grep -o 'Resource_List.walltime = [^ ]*' | cut -d' ' -f3)
+    Q=$(echo "$QF" | grep -o 'queue = [^ ]*' | cut -d' ' -f3)
+    NEW=$(env -i PATH=$PATH HOME=$HOME USER=$USER LOGNAME=$USER CONFIG=$CONFIG NUM_NODES=$NUM_NODES \
+          GPUS_PER_NODE=$GPUS_PER_NODE RUN_NUM=$RUN_NUM MODE=$MODE TIME_LIMIT=$TIME_LIMIT YAML=$YAML \
+          RETRY=$((RETRY + 1)) MAX_RETRY=$MAX_RETRY \
+          qsub -q $Q@pbspl4 -N $PBS_JOBNAME -o pbs_logs/$PBS_JOBNAME.out.temp -e pbs_logs/$PBS_JOBNAME.err.temp \
+               -l select=$SEL -l walltime=$WT -l place=scatter:excl \
+               -v CONFIG,NUM_NODES,GPUS_PER_NODE,RUN_NUM,MODE,TIME_LIMIT,YAML,RETRY,MAX_RETRY \
+               $PBS_O_WORKDIR/shell_scripts/nas_merra2_train.pbs)
+    echo "resubmitted as $NEW"
+  fi
+  exit 3
+fi
+NODES=(${GOOD[@]:0:$NUM_NODES})
+export MASTER_ADDR=${NODES[0]}
+echo "running on: ${NODES[@]} (master $MASTER_ADDR)"
+
+ARGS="$NUM_NODES $WORLD_SIZE $MASTER_ADDR $MASTER_PORT $JOB_ID $PBS_JOBID $TMPDIR $GPUS_PER_NODE $CONFIG $RUN_NUM $MODE $TIME_LIMIT $YAML"
+C=1
+for node in ${NODES[@]}; do
+  if [[ $node != $MASTER_ADDR ]]; then
+    ssh -o StrictHostKeyChecking=no -i $HOME/.ssh/id_rsa $node "cd $BASE; sh shell_scripts/nas_launch.sh $C $ARGS" &
+    C=$((C + 1))
+    sleep 2
+  fi
+done
+
+# process on master node runs the last! (via ssh when the PBS head node failed the probe)
+if [[ $MASTER_ADDR == $ORIG_HEAD ]]; then
+  sh $BASE/shell_scripts/nas_launch.sh 0 $ARGS; RC=$?
+else
+  ssh -o StrictHostKeyChecking=no -i $HOME/.ssh/id_rsa $MASTER_ADDR "cd $BASE; sh shell_scripts/nas_launch.sh 0 $ARGS"; RC=$?
+fi
+
+wait
+echo "Done with PBS (rc=$RC)"
+exit $RC

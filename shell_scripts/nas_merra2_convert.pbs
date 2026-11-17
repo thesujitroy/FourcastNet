@@ -1,0 +1,37 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_m2_convert
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## MERRA-2 (Prithvi WxC daily files) -> FourCastNet year files, data_process/merra2_to_fcn.py:
+## 44 years, 20 channels, 6-hourly, about 1.1 TB under /nobackupnfs1/sroy14/FourCastNet_MERRA2,
+## then global_means.npy / global_stds.npy over the training years. CPU only. Resumable:
+## years already written are skipped and a half-written year continues at its next month,
+## so resubmit unchanged after a walltime kill. Do not run two of these at once.
+## Submit from FourCastNet/:   qsub shell_scripts/nas_merra2_convert.pbs
+##   -v YEARS=1980-1999,JOBS=20 for a subset (commas: pass the variable by name, see README)
+
+#PBS -l select=1:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -l place=scatter:excl
+#PBS -q gpu_normal@pbspl4
+#PBS -l walltime=08:00:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_m2_convert.out.temp
+#PBS -e pbs_logs/fcn_m2_convert.err.temp
+
+cd "$PBS_O_WORKDIR"
+JOB_ID=${PBS_JOBID%%.*}
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp pbs_logs/${JOB_ID}_${PBS_JOBNAME}.${ext}
+done
+. shell_scripts/nas_env.sh
+OUT=${OUT:-/nobackupnfs1/sroy14/FourCastNet_MERRA2}
+
+echo "=== conversion on $(hostname), $(date)"
+python data_process/merra2_to_fcn.py --out $OUT --years ${YEARS:-1980-2023} --jobs ${JOBS:-40}
+RC=$?
+ls -l $OUT/train $OUT/test $OUT/out_of_sample $OUT/stats
+du -sh $OUT
+echo "=== done rc=$RC $(date)"
+exit $RC

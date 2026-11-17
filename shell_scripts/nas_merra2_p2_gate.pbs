@@ -1,0 +1,72 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_m2p2_gate
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## Sizing gate for the patch-2 MERRA-2 runs (config/mixer_comparison_merra2_p2.yaml), on one
+## devel node: for every config, 20 training steps on 4 GPUs with 4, then 2, then 1 samples
+## per GPU (the first that fits is kept), W&B offline, into expts/mixer_comparison_merra2_p2_devel.
+## Prints parameters, images per second and peak GPU memory, which decide how many GPUs a
+## full run needs for the global batch of 64.
+## Submit from FourCastNet/:   qsub shell_scripts/nas_merra2_p2_gate.pbs
+
+#PBS -l select=1:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -l place=scatter:excl
+#PBS -q gpu_devel@pbspl4
+#PBS -l walltime=01:30:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_m2p2_gate.out.temp
+#PBS -e pbs_logs/fcn_m2p2_gate.err.temp
+
+cd "$PBS_O_WORKDIR"
+JOB_ID=${PBS_JOBID%%.*}
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp pbs_logs/${JOB_ID}_${PBS_JOBNAME}.${ext}
+done
+. shell_scripts/nas_env.sh
+LOGS=pbs_logs/m2p2_gate_${JOB_ID}
+mkdir -p $LOGS
+YAML=${YAML:-config/mixer_comparison_merra2_p2.yaml}     # patch 8: -v YAML=config/mixer_comparison_merra2.yaml,PER_GPU=16
+CONFIGS=${CONFIGS:-"afno tucker_free tucker_spectral tucker_adaptive tucker_spectral_dct"}
+PER_GPU=${PER_GPU:-"4 2 1"}
+STEPS=${STEPS:-20}
+DEVEL=${DEVEL:-$PWD/expts/mixer_comparison_merra2_p2_devel}
+RC=0
+
+nvidia-smi -L
+for attempt in 1 2 3 4 5 6; do
+  if timeout 180 python -c "import torch; n = torch.cuda.device_count(); assert n == 4, n; [torch.ones(1, device=f'cuda:{i}').item() for i in range(n)]" \
+      > $LOGS/probe.log 2>&1; then
+    break
+  fi
+  echo "GPU probe attempt $attempt/6 failed: $(tail -n 1 $LOGS/probe.log)"
+  [ $attempt -eq 6 ] && { echo "GPUs unusable, giving up"; exit 3; }
+  sleep 30
+done
+
+for config in $CONFIGS; do
+  FIT=
+  for b in $PER_GPU; do
+    echo "=== $config, $b samples per GPU, $(date)"
+    rm -rf $DEVEL/$config
+    if WANDB_MODE=offline timeout 900 torchrun --standalone --nproc_per_node=4 train_mixers.py \
+        --yaml_config $YAML --config $config --run_num 0 --enable_amp \
+        --override max_epochs=1 max_iters_per_epoch=$STEPS n_valid_samples=16 batch_size=$((4 * b)) exp_dir=$DEVEL \
+                   wandb_group=merra2-fcn-mixer-comparison-p2-devel \
+        > $LOGS/train_${config}_b$b.log 2>&1; then
+      FIT=$b
+      cat $DEVEL/$config/0/model.jsonl $DEVEL/$config/0/epochs.jsonl $DEVEL/$config/0/validation.jsonl 2>&1 | cut -c1-1500
+      break
+    fi
+    echo "did not run: $(grep -m1 -E 'OutOfMemoryError|out of memory|Error' $LOGS/train_${config}_b$b.log | cut -c1-300)"
+    tail -n 3 $LOGS/train_${config}_b$b.log | cut -c1-300
+  done
+  if [ -n "$FIT" ]; then
+    echo "RESULT $config: fits at $FIT samples per GPU"
+  else
+    echo "RESULT $config: FAILED at every batch size"; RC=1
+  fi
+done
+echo "=== done rc=$RC $(date)"
+exit $RC
