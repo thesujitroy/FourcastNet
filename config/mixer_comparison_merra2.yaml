@@ -99,6 +99,13 @@ afno:
   <<: *base
   mixer: {type: afno}         # FourCastNet itself: num_blocks 8, sparsity 0.01
 
+# Global softmax self-attention over every token (networks/mixers.py::GridAttention, PyTorch SDPA),
+# the same settings as the ERA5 comparison: 12 heads of 64 channels. Not a published mixer
+# for FourCastNet; the attention reference beside AFNO.
+vanilla:
+  <<: *base
+  mixer: {type: vanilla, num_heads: 12, qkv_bias: false, attn_drop: 0.0, proj_drop: 0.0}
+
 tucker_free:
   <<: *base
   mixer: {type: tucker_free, L: 4, p: 32, q: 32, r: 128, zero_init: false, backend: gemm}

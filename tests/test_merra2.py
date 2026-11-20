@@ -226,6 +226,31 @@ def test_merra2_configs_differ_only_in_the_mixer():
     assert loaded['tucker_spectral_dct'].mixer['basis'] == 'dct'
 
 
+CONFIG_P2 = ROOT / 'config' / 'mixer_comparison_merra2_p2.yaml'
+
+
+@pytest.mark.parametrize('yaml_file', [CONFIG, CONFIG_P2], ids=['p8', 'p2'])
+def test_vanilla_attention_config_is_afno_with_the_era5_attention_mixer(yaml_file):
+    """Vanilla attention on MERRA-2: the AFNO config with the mixer swapped for the attention
+    the ERA5 comparison used, nothing else changed."""
+    vanilla, afno = Params(yaml_file, 'vanilla'), Params(yaml_file, 'afno')
+    differing = {k for k in set(vanilla.params) | set(afno.params)
+                 if vanilla.params.get(k) != afno.params.get(k)}
+    assert differing == {'mixer'}
+    assert vanilla.mixer == Params(ROOT / 'config' / 'mixer_comparison.yaml', 'vanilla').mixer
+    assert vanilla.embed_dim % vanilla.mixer['num_heads'] == 0
+
+
+def test_vanilla_attention_runs_at_full_size_patch_8():
+    p = Params(CONFIG, 'vanilla')
+    p['N_in_channels'] = p['N_out_channels'] = len(p.in_channels)
+    torch.manual_seed(0)
+    model = MixerNet(p, img_size=(360, 576), embed_dim=p.embed_dim, depth=p.depth).eval()
+    with torch.no_grad():
+        y = model(torch.randn(1, 20, 360, 576))
+    assert y.shape == (1, 20, 360, 576) and torch.isfinite(y).all()
+
+
 # The 1/L check: each Tucker config again with `term_norm: true` and nothing else changed.
 TERM_NORM = {'tucker_free_termnorm': 'tucker_free', 'tucker_spectral_termnorm': 'tucker_spectral',
              'tucker_spectral_dct_gemm_termnorm': 'tucker_spectral_dct_gemm',
