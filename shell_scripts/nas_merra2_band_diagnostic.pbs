@@ -1,0 +1,94 @@
+#PBS -S /usr/bin/sh
+#PBS -N fcn_m2_band
+#PBS -W umask=002
+#PBS -W group_list=s3331
+
+## Spectral band diagnostic (scripts/band_diagnostic_mixers.py) on the trained MERRA-2 runs:
+## where the energy of each attention block's output sits in the wavenumber plane, and what
+## test-time band limiting of every block does to the validation loss. Inference only, on the
+## 256 validation samples of training. Three GPUs in parallel:
+##   GPU 0  patch 8: vanilla (energy + bands), then tucker_spectral and afno (branch off only)
+##   GPU 1  patch 2: vanilla (energy + bands)
+##   GPU 2  patch 2: tucker_spectral, then afno (branch off only)
+## Submit from FourCastNet/:   qsub shell_scripts/nas_merra2_band_diagnostic.pbs
+## Results: results/band_diagnostic/{p8,p2}/<config>/{summary,ablation}.json, band_energy.npz, run_<job>.log
+
+#PBS -l select=1:model=mil_a100:ncpus=64:ngpus=4:mem=480GB
+#PBS -q gpu_devel@pbspl4
+#PBS -l walltime=01:30:00
+
+#PBS -kod -ked
+#PBS -o pbs_logs/fcn_m2_band.out.temp
+#PBS -e pbs_logs/fcn_m2_band.err.temp
+
+cd "$PBS_O_WORKDIR"
+JOB_ID=${PBS_JOBID%%.*}
+for ext in out err; do
+  [ -f pbs_logs/${PBS_JOBNAME}.${ext}.temp ] && mv pbs_logs/${PBS_JOBNAME}.${ext}.temp pbs_logs/${JOB_ID}_${PBS_JOBNAME}.${ext}
+done
+
+. shell_scripts/nas_env.sh
+nvidia-smi -L
+OUT=results/band_diagnostic
+mkdir -p $OUT/p8 $OUT/p2 pbs_logs
+
+## Bands of the ablation, as wavenumbers kept per axis (0 = branch off). The last one of each
+## list is the spectral Tucker band of that patch size (23 x 23 and 90 x 91).
+BANDS_P8=${BANDS_P8:-"0 3 6 12 23"}
+BANDS_P2=${BANDS_P2:-"0 6 12 23 45 90x91"}
+CONTROLS=${CONTROLS:-"tucker_spectral afno"}
+
+## Freshly allocated mil_a100 nodes often answer "CUDA-capable device(s) is/are busy or
+## unavailable" for the first minute: touch the GPUs, retrying, before starting.
+for attempt in 1 2 3 4 5 6; do
+  if timeout 180 python -c "import torch; [torch.ones(1, device=f'cuda:{i}').item() for i in range(3)]" \
+      > $OUT/probe_${JOB_ID}.log 2>&1; then
+    break
+  fi
+  echo "GPU probe attempt $attempt/6 failed: $(tail -n 1 $OUT/probe_${JOB_ID}.log)"
+  [ $attempt -eq 6 ] && { echo "GPUs unusable, giving up"; exit 3; }
+  sleep 30
+done
+
+echo "=== self-test $(date)"
+CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=4 python scripts/band_diagnostic_mixers.py --self-test || { echo "self-test failed"; exit 4; }
+
+## diag <gpu> <p8|p2> <yaml> <batch> <config> <bands...>
+diag() {
+  gpu=$1; tag=$2; yaml=$3; batch=$4; config=$5; shift 5
+  mkdir -p $OUT/$tag/$config
+  echo "=== $tag $config on GPU $gpu, bands: $*, $(date)"
+  CUDA_VISIBLE_DEVICES=$gpu python scripts/band_diagnostic_mixers.py --yaml_config $yaml --config $config \
+      --batch $batch --bands "$@" --out $OUT/$tag/$config > $OUT/$tag/$config/run_${JOB_ID}.log 2>&1 \
+      || { echo "=== $tag $config FAILED"; return 1; }
+}
+P8=config/mixer_comparison_merra2.yaml
+P2=config/mixer_comparison_merra2_p2.yaml
+
+( rc=0; diag 0 p8 $P8 16 vanilla $BANDS_P8 || rc=1
+  for c in $CONTROLS; do diag 0 p8 $P8 16 $c 0 || rc=1; done; exit $rc ) &
+PIDS="$!"
+( diag 1 p2 $P2 2 vanilla $BANDS_P2 ) &
+PIDS="$PIDS $!"
+( rc=0; for c in $CONTROLS; do diag 2 p2 $P2 2 $c 0 || rc=1; done; exit $rc ) &
+PIDS="$PIDS $!"
+
+RC=0
+for pid in $PIDS; do wait $pid || RC=1; done
+
+for tag in p8 p2; do
+  for config in vanilla $CONTROLS; do
+    echo "=================== $tag $config"
+    sed -n '/validation loss .* on .* samples/,$p' $OUT/$tag/$config/run_${JOB_ID}.log
+    [ $RC -ne 0 ] && tail -n 15 $OUT/$tag/$config/run_${JOB_ID}.log
+  done
+done
+
+## figures (CPU; skipped quietly if the plotting script is not there)
+if [ -f ../plot_diagnostic_figures.py ]; then
+  ( cd .. && CUDA_VISIBLE_DEVICES= MPLBACKEND=Agg python plot_diagnostic_figures.py fcn_band ) \
+      > $OUT/figures_${JOB_ID}.log 2>&1 || echo "figure step failed, see $OUT/figures_${JOB_ID}.log"
+  tail -n 5 $OUT/figures_${JOB_ID}.log
+fi
+echo "Done with PBS (rc=$RC)"
+exit $RC
